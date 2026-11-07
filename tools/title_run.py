@@ -21,7 +21,7 @@ import unwrap_self
 from package_release import windows_runtime
 OUTCOMES = ("relink-failed", "crashed", "exited", "stalled", "frame-unreadable", "blank", "rendering")
 TITLE_ID = re.compile(r"[A-Z]{4}[0-9]{5}")
-TITLE_FIELDS = {"relink": list, "fixed_base": str, "executables": list, "seconds": int, "env": dict, "pad": dict}
+TITLE_FIELDS = {"relink": list, "fixed_base": str, "executables": list, "seconds": int, "env": dict, "pad": dict, "smoke": bool}
 FIXED_BASE_FLAGS = {"windows": "--windows-fixed-base", "linux": "--linux-fixed-base"}
 PAD_FIELDS = {"events", "after_s", "repeat", "gap_ms"}
 PAD_AFTER_SECONDS = 5
@@ -169,6 +169,11 @@ def render_markdown(summary, previous=None):
     header += f". {known}." if known else "."
     header += f" {summary['runs']} run{'' if summary['runs'] == 1 else 's'} per title, {summary['seconds']} s each."
     lines = [header, ""]
+    if "smoke" in summary:
+        smoke = summary["smoke"]
+        lines += [f"Startup smoke: {'PASS' if smoke['passed'] else 'FAIL'} ({len(smoke['ids'])} required titles).", ""]
+        if smoke["failed"]:
+            lines += ["Not rendering in every requested run: " + ", ".join(smoke["failed"]), ""]
     columns = ["Title", "ID", "Version", "Cold", "Warm", "FPS", "First error"] + (["Before"] if previous else [])
     if previous:
         regressions, improvements = compare(summary, previous)
@@ -527,6 +532,12 @@ def last_line(text):
 
 
 def write_summary(output, summary):
+    if "smoke" in summary:
+        smoke = summary["smoke"]
+        smoke["failed"] = [title_id for title_id in smoke["ids"]
+                           if len(summary["titles"].get(title_id, {}).get("runs", [])) != summary["runs"]
+                           or any(run["outcome"] != "rendering" for run in summary["titles"][title_id]["runs"])]
+        smoke["passed"] = bool(smoke["ids"]) and not smoke["failed"]
     (output / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
 
 
@@ -536,18 +547,26 @@ def main(argv=None):
     parser.add_argument("--games", action="append", type=Path, required=True, help="directory searched for extracted packages")
     parser.add_argument("--build", type=Path, default=ROOT / "build")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--runs", type=positive, default=2)
+    parser.add_argument("--runs", type=positive, help="runs per title (default: 2, or 1 with --smoke)")
     parser.add_argument("--seconds", type=positive, help="run length for every title (default: the title's, else 60)")
     parser.add_argument("--note", default="", help="free text for the report, e.g. 'main + #6814'")
     parser.add_argument("--compare", type=Path, help="summary.json of an earlier run")
     parser.add_argument("--titles", type=Path, default=ROOT / "tools/titles.json")
+    parser.add_argument("--smoke", action="store_true", help="run every title marked smoke; require all runs to render (default: 1 run, 30 s)")
     args = parser.parse_args(argv)
+    if args.smoke and args.ids:
+        parser.error("--smoke cannot be combined with title IDs")
+    args.runs = args.runs if args.runs is not None else 1 if args.smoke else 2
+    if args.smoke and args.seconds is None:
+        args.seconds = 30
     args.out = args.out or args.build / "title-runs"
     previous = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
     platform = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
     titles = load_titles(args.titles)
     found = discover(args.games)
-    ids = args.ids or sorted(found)
+    ids = sorted(title_id for title_id, entry in titles.items() if entry.get("smoke", False)) if args.smoke else args.ids or sorted(found)
+    if args.smoke and not ids:
+        raise SystemExit("no titles marked smoke in --titles")
     missing = [title_id for title_id in ids if title_id not in found]
     if missing:
         raise SystemExit(f"not found under --games: {', '.join(missing)}")
@@ -555,7 +574,7 @@ def main(argv=None):
     busy = [title_id for title_id, handle in locks.items() if handle is None]
     if busy:
         raise SystemExit(f"already running in {args.out.resolve() / 'work'}: {', '.join(busy)}")
-    if previous and args.ids:
+    if previous and (args.ids or args.smoke):
         previous["titles"] = {title_id: title for title_id, title in previous["titles"].items() if title_id in ids}
     source = source_root(args.build)
     commit = git(source, "rev-parse", "--short", "HEAD")
@@ -563,6 +582,8 @@ def main(argv=None):
     summary = {"build": {"commit": commit, "dirty": bool(git(source, "status", "--porcelain", "--untracked-files=no")), "note": args.note},
                "machine": {"os": "", "gpu": "", "driver": "", "cpu": ""}, "runs": args.runs, "seconds": args.seconds or 60,
                "driver_cache": "isolated" if platform == "linux" else "shared (not isolated)", "titles": {}}
+    if args.smoke:
+        summary["smoke"] = {"ids": ids}
     for title_id in ids:
         entry = titles.get(title_id, {})
         seconds = args.seconds or entry.get("seconds", 60)
@@ -596,7 +617,7 @@ def main(argv=None):
     (output / "summary.md").write_text(report, encoding="utf-8")
     print(report)
     print(f"written to {output}")
-    return 0
+    return 1 if args.smoke and not summary["smoke"]["passed"] else 0
 
 
 if __name__ == "__main__":
