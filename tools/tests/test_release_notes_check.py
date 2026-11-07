@@ -50,6 +50,21 @@ class FeatureTests(unittest.TestCase):
         source.write_text("{")
         self.assertEqual(self.cli("prepare_release_notes.py", *args).returncode, 2)
 
+    @unittest.skipUnless(os.name == "nt", "Windows path comparison")
+    def test_new_outputs_differing_only_in_case_are_rejected_without_writes(self):
+        source = self.root / "response.json"
+        source.write_text(json.dumps({"body": "Release notes"}), encoding="utf-8")
+        original = source.read_bytes()
+        for options in (["--check"], []):
+            with self.subTest(options=options):
+                result = self.cli("prepare_release_notes.py", "--input", source,
+                                  "--body", self.root / "notes.txt", "--full", self.root / "NOTES.txt", *options)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("must be distinct files", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(source.read_bytes(), original)
+                self.assertEqual(list(self.root.iterdir()), [source])
+
 
 if __name__ == "__main__":
     unittest.main()
