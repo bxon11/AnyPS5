@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -26,7 +28,16 @@ class TitlesTests(unittest.TestCase):
 
     def test_repository_file_is_valid(self):
         titles = title_run.load_titles(title_run.ROOT / "tools/titles.json")
-        self.assertEqual(titles["PPSA85300"], {"relink": ["--registry"]})
+        self.assertEqual(titles["PPSA85300"], {"smoke": True, "relink": ["--registry"]})
+        self.assertEqual({title_id for title_id, entry in titles.items() if entry.get("smoke")},
+                         {"PPSA59322", "PPSA85300", "PPSA98766", "PPSA99007", "PPSA99203"})
+
+    def test_smoke_requires_a_boolean(self):
+        for value in (1, 0, "true", [], None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "smoke must be bool"):
+                title_run.load_titles(self.write({"PPSA00001": {"smoke": value}}))
+        self.assertEqual(title_run.load_titles(self.write({"PPSA00001": {"smoke": False}})),
+                         {"PPSA00001": {"smoke": False}})
 
     def test_unknown_field_is_refused(self):
         with self.assertRaisesRegex(ValueError, "PPSA00001: unknown field rlink"):
@@ -296,6 +307,140 @@ def wait_until(condition, seconds=10):
             return True
         time.sleep(0.1)
     return False
+
+
+class SmokeTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.entries = {"PPSA00003": {"smoke": True, "relink": ["--registry"], "seconds": 90},
+                        "PPSA00001": {"smoke": True}, "PPSA00002": {"smoke": False}, "PPSA00004": {}}
+        self.titles = self.root / "titles.json"
+        self.games = self.root / "games"
+        for title_id in self.entries:
+            package(self.games / title_id, title_id)
+
+    def execute(self, options=(), outcomes=(), refused=(), entries=None):
+        self.titles.write_text(json.dumps(self.entries if entries is None else entries), encoding="utf-8")
+        self.output = self.root / "out"
+        def prepare(title_id, found, entry, platform, build, work):
+            if title_id in refused:
+                raise RuntimeError("conversion refused")
+            work.mkdir(parents=True, exist_ok=True)
+            (work / "relink.log").write_text("converted\n", encoding="utf-8")
+            return work / "output"
+        def result(outcome):
+            return {"outcome": outcome, "exit_code": None, "seconds": 30, "presents": 60, "fps": 2.0,
+                    "first_error": "", "warnings": {}, "frames": [], "gpu": "test GPU", "driver": "test driver",
+                    "os": "test OS", "cpu": "test CPU"}
+        with contextlib.ExitStack() as stack:
+            self.prepare = stack.enter_context(unittest.mock.patch.object(title_run, "prepare", side_effect=prepare))
+            self.run = stack.enter_context(unittest.mock.patch.object(title_run, "run_title", side_effect=lambda *args: result("rendering")))
+            if outcomes:
+                self.run.side_effect = [result(outcome) for outcome in outcomes]
+            lock_work = title_run.lock_work
+            def lock(path):
+                handle = lock_work(path)
+                return stack.enter_context(handle) if handle is not None else None
+            stack.enter_context(unittest.mock.patch.object(title_run, "lock_work", side_effect=lock))
+            stack.enter_context(unittest.mock.patch.object(title_run, "git", side_effect=lambda root, *args: "abc1234" if args[0] == "rev-parse" else ""))
+            self.printed = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            status = title_run.main(["--games", str(self.games), "--out", str(self.output), "--titles", str(self.titles), *options])
+        report = next(self.output.glob("*/summary.json"))
+        return status, json.loads(report.read_text(encoding="utf-8")), report.with_suffix(".md").read_text(encoding="utf-8")
+
+    def test_smoke_runs_the_complete_set_in_order_and_reports_success(self):
+        status, data, report = self.execute(["--smoke"])
+        self.assertEqual(status, 0)
+        self.assertEqual(list(data["titles"]), ["PPSA00001", "PPSA00003"])
+        self.assertEqual(data["smoke"], {"ids": ["PPSA00001", "PPSA00003"], "failed": [], "passed": True})
+        self.assertEqual(data["runs"], 1)
+        self.assertEqual([call.args[3] for call in self.run.call_args_list], [30, 30])
+        self.assertEqual(self.prepare.call_args_list[1].args[2]["relink"], ["--registry"])
+        self.assertIn("Startup smoke: PASS (2 required titles).", report)
+        self.assertEqual(data["machine"]["gpu"], "test GPU")
+
+    def test_every_non_rendering_outcome_fails_after_running_the_other_titles(self):
+        for outcome in title_run.OUTCOMES[:-1]:
+            with self.subTest(outcome=outcome):
+                status, data, report = self.execute(["--smoke"], [outcome, "rendering"])
+                self.assertEqual(status, 1)
+                self.assertEqual(data["smoke"]["failed"], ["PPSA00001"])
+                self.assertFalse(data["smoke"]["passed"])
+                self.assertEqual(self.run.call_count, 2)
+                self.assertIn("Startup smoke: FAIL", report)
+                self.assertIn("Not rendering in every requested run: PPSA00001", report)
+
+    def test_conversion_failure_is_reported_and_does_not_skip_the_remaining_title(self):
+        status, data, report = self.execute(["--smoke"], refused=["PPSA00001"])
+        self.assertEqual(status, 1)
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self.run.call_count, 1)
+        self.assertEqual(data["titles"]["PPSA00001"]["runs"][0]["outcome"], "relink-failed")
+        self.assertIn("conversion refused", report)
+
+    def test_explicit_duration_and_repetitions_override_the_smoke_defaults(self):
+        status, data, report = self.execute(["--smoke", "--runs", "2", "--seconds", "45"],
+                                          ["rendering", "crashed", "rendering", "rendering"])
+        self.assertEqual(status, 1)
+        self.assertEqual((data["runs"], data["seconds"]), (2, 45))
+        self.assertEqual([call.args[3] for call in self.run.call_args_list], [45] * 4)
+        self.assertEqual([entry["cache"] for entry in data["titles"]["PPSA00001"]["runs"]], ["cold", "warm"])
+        self.assertEqual(data["smoke"]["failed"], ["PPSA00001"])
+
+    def test_missing_required_title_refuses_before_locking_or_preparing(self):
+        entries = {**self.entries, "PPSA99999": {"smoke": True}}
+        with unittest.mock.patch.object(title_run, "lock_work") as lock:
+            with self.assertRaisesRegex(SystemExit, "not found under --games: PPSA99999"):
+                self.execute(["--smoke"], entries=entries)
+        lock.assert_not_called()
+        self.prepare.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_empty_smoke_set_cannot_pass(self):
+        with self.assertRaisesRegex(SystemExit, "no titles marked smoke"):
+            self.execute(["--smoke"], entries={})
+        self.assertFalse(self.output.exists())
+
+    def test_explicit_ids_cannot_silently_shrink_the_smoke_set(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            self.execute(["--smoke", "PPSA00001"])
+        self.assertEqual(error.exception.code, 2)
+        self.prepare.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_partial_summary_cannot_claim_smoke_success(self):
+        data = summary({"PPSA00001": {"runs": [run("rendering")]}})
+        data["runs"] = 1
+        data["smoke"] = {"ids": ["PPSA00001", "PPSA00003"]}
+        title_run.write_summary(self.root, data)
+        saved = json.loads((self.root / "summary.json").read_text(encoding="utf-8"))
+        self.assertFalse(saved["smoke"]["passed"])
+        self.assertEqual(saved["smoke"]["failed"], ["PPSA00003"])
+        data["smoke"]["ids"] = ["PPSA00001"]
+        data["runs"] = 2
+        title_run.write_summary(self.root, data)
+        self.assertFalse(data["smoke"]["passed"])
+
+    def test_comparison_is_limited_to_the_required_set(self):
+        previous = self.root / "previous.json"
+        previous.write_text(json.dumps(summary({"PPSA00002": {"name": "Unrelated", "runs": [run("rendering")]},
+                                               "PPSA00001": {"name": "Game", "runs": [run("crashed")]}})), encoding="utf-8")
+        status, data, report = self.execute(["--smoke", "--compare", str(previous)])
+        self.assertEqual(status, 0)
+        self.assertIn("Improvements: Game (PPSA00001) crashed -> rendering", report)
+        self.assertNotIn("Missing:", report)
+        self.assertNotIn("Unrelated", report)
+
+    def test_normal_runs_keep_their_defaults_and_reporting_exit_status(self):
+        status, data, report = self.execute(outcomes=["crashed"] * 8)
+        self.assertEqual(status, 0)
+        self.assertNotIn("smoke", data)
+        self.assertEqual(list(data["titles"]), sorted(self.entries))
+        self.assertEqual(data["runs"], 2)
+        self.assertEqual([call.args[3] for call in self.run.call_args_list], [60, 60, 60, 60, 90, 90, 60, 60])
+        self.assertNotIn("Startup smoke:", report)
 
 
 class PadTests(unittest.TestCase):
